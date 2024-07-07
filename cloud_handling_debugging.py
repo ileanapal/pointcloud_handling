@@ -4,7 +4,6 @@ import numpy as np
 import open3d as o3d
 import math
 
-
 def parse_foldername(foldername):
     # Parse the folder name to extract position coordinates and orientation angle
     match = re.match(r"\((-?\d+\.?\d*),\s*(-?\d+\.?\d*),\s*(-?\d+\.?\d*)\),\s*(\d+)", foldername)
@@ -88,28 +87,19 @@ def merge_clouds(cloud_dirs, every_k_points=10):
         # Calculate rotation and translation matrices
         rot_matrix, trans_matrix = get_transform_matrices(position, roll=0, yaw=0, pitch=pitch, scale=scale)
 
-        # Apply rotation and translation transformations
-        rotated_points = np.asarray(cloud.points) @ rot_matrix.T
-        translated_points = rotated_points + trans_matrix
-        cloud.points = o3d.utility.Vector3dVector(translated_points)
+        transform_matrix = np.eye(4)
+        transform_matrix[:3, :3] = rot_matrix
+        transform_matrix[:3, 3] = trans_matrix
+        cloud.transform(transform_matrix)
 
         merged_cloud_p1, merged_cloud_p2, twoD_position_1, twoD_position_2 = get_two_point_clouds(merged_cloud_p1, merged_cloud_p2, cloud_dirs, position, cloud)
-    
-    # Fine tuning with mean and largest
-    counter = 0
-    while counter < 3:
-        trans_correction_vector_largest = find_largest_coordinates(merged_cloud_p2) - find_largest_coordinates(merged_cloud_p1) + np.array([0, (twoD_position_2[0]-twoD_position_1[0]) * scale, (twoD_position_2[1]-twoD_position_1[1]) * scale])
-        merged_cloud_p1 = translate(merged_cloud_p1, trans_correction_vector_largest)
-        
-        trans_correction_vector_mean = np.mean(merged_cloud_p2.points, axis=0) - np.mean(merged_cloud_p1.points, axis=0)
-        merged_cloud_p1 = translate(merged_cloud_p1, trans_correction_vector_mean)
-        
-        counter += 1
+
+    merged_cloud_p1.translate([(twoD_position_2[1] - twoD_position_1[1]) * scale*10, 0, (twoD_position_2[0] - twoD_position_1[0]) * scale*10])
 
     if merged_cloud_p1 is None:
-        print("No ply files found for z=3 and y=0.")
+        print("No ply files found for point 1")
     if merged_cloud_p2 is None:
-        print("No ply files found for z=1 and y=2.")
+        print("No ply files found for point2")
     
     merged_cloud_all = merged_cloud_p1 + merged_cloud_p2
 
@@ -135,19 +125,6 @@ def get_two_point_clouds(merged_cloud_p1, merged_cloud_p2, cloud_dirs, position,
             merged_cloud_p2 += cloud
     
     return merged_cloud_p1, merged_cloud_p2, twoD_position_1, twoD_position_2
-
-
-def translate(merged_cloud, trans_matrix):
-    # Convert the point cloud to a NumPy array
-    points = np.asarray(merged_cloud.points)
-
-    # Add the translation correction vector to each point
-    translated_points = points + trans_matrix
-
-    # Update the translated points in the point cloud
-    merged_cloud.points = o3d.utility.Vector3dVector(translated_points)
-
-    return merged_cloud
 
 def find_largest_coordinates(merged_cloud):
     max_x = max_y = max_z = -float('inf')  # Initialize with negative infinity
@@ -198,84 +175,21 @@ def store_positions(cloud_dirs):
 
     return positions
 
-def draw_registration_result(source, target, transformation):
-    copy = None
-    source_temp = copy.deepcopy(source)
-    target_temp = copy.deepcopy(target)
-    source_temp.paint_uniform_color([1, 0.706, 0])
-    target_temp.paint_uniform_color([0, 0.651, 0.929])
-    source_temp.transform(transformation)
-    o3d.visualization.draw_geometries([source_temp, target_temp],
-                                      zoom=0.4559,
-                                      front=[0.6452, -0.3036, -0.7011],
-                                      lookat=[1.9892, 2.0208, 1.8945],
-                                      up=[-0.2779, -0.9482, 0.1556])
-    
-def preprocess_point_cloud(pcd, voxel_size):
-    print(":: Downsample with a voxel size %.3f." % voxel_size)
-    pcd_down = pcd.voxel_down_sample(voxel_size)
-
-    radius_normal = voxel_size * 2
-    print(":: Estimate normal with search radius %.3f." % radius_normal)
-    pcd_down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
-
-    radius_feature = voxel_size * 5
-    print(":: Compute FPFH feature with search radius %.3f." % radius_feature)
-    pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        pcd_down,
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
-    return pcd_down, pcd_fpfh
-
-def prepare_dataset(voxel_size, merged_cloud_p1, merged_cloud_p2):
-    print(":: Load two point clouds and disturb initial pose.")
-
-    source = merged_cloud_p1
-    target = merged_cloud_p2
-    trans_init = np.asarray([[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0],
-                             [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
-    source.transform(trans_init)
-    draw_registration_result(source, target, np.identity(4))
-
-    source_down, source_fpfh = preprocess_point_cloud(source, voxel_size)
-    target_down, target_fpfh = preprocess_point_cloud(target, voxel_size)
-    return source, target, source_down, target_down, source_fpfh, target_fpfh
-
-def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
-    distance_threshold = voxel_size * 1.5
-    print(":: RANSAC registration on downsampled point clouds.")
-    print("   Since the downsampling voxel size is %.3f," % voxel_size)
-    print("   we use a liberal distance threshold %.3f." % distance_threshold)
-    result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        source_down, target_down, source_fpfh, target_fpfh, True,
-        distance_threshold,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        3, [
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(
-                0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
-                distance_threshold)
-        ], o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
-    return result
-
 if __name__ == "__main__":
     # Root directory path
-    root_dir = "C:\\Users\\ilean\\Downloads\\pointcloud_handling-main-jul5\\pointcloud_handling-main\\PQ512"
+    root_dir = os.path.expanduser("~/Documents/Documents/PolyU/SureFire/URIS/pointcloud_handling/pointcloud_handling-main/PQ512")
     # Get all subdirectory paths under the root directory
     cloud_dirs = [os.path.join(root_dir, d) for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
     every_k_points = 10  # Downsample factor
 
     merged_cloud_p1, merged_cloud_p2, merged_cloud_all = merge_clouds(cloud_dirs, every_k_points)
     
-    voxel_size = 0.05  # means 5cm for this dataset
-    source, target, source_down, target_down, source_fpfh, target_fpfh = prepare_dataset(voxel_size, merged_cloud_p1, merged_cloud_p2)
+    if merged_cloud_all is not None:
+        print("Merged point cloud")
+        print(merged_cloud_all)
 
-    result_ransac = execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size)
-    print(result_ransac)
-    draw_registration_result(source_down, target_down, result_ransac.transformation)
+        o3d.visualization.draw_geometries([merged_cloud_all])
 
-    # if merged_cloud_all is not None:
-    #     print("Merged point cloud")
-    #     print(merged_cloud_all)
-
-    #     o3d.visualization.draw_geometries([merged_cloud_all])
+    cropped_cloud = merged_cloud_all.crop(o3d.geometry.AxisAlignedBoundingBox(min_bound=(-3000,-5000,-1000), max_bound=(700,5000,4000)))
+    if cropped_cloud is not None:        
+        o3d.visualization.draw_geometries([cropped_cloud])
